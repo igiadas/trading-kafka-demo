@@ -1,5 +1,7 @@
 # Trading Kafka Demo
 
+[![CI](https://github.com/igiadas/trading-kafka-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/igiadas/trading-kafka-demo/actions/workflows/ci.yml)
+
 A small, personal learning project: an event-driven order flow for equity trading, built with
 **.NET 8** and **Apache Kafka** using the plain [`Confluent.Kafka`](https://github.com/confluentinc/confluent-kafka-dotnet)
 client (no MassTransit or other abstraction on top, so every Kafka concept is visible in the code).
