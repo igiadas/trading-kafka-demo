@@ -2,6 +2,7 @@ using System.Text.Json.Serialization;
 using Confluent.Kafka;
 using Kotiz.Contracts;
 using Kotiz.OrderApi;
+using Kotiz.OrderApi.Portfolio;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -30,10 +31,17 @@ builder.Services.AddSingleton<IProducer<string, string>>(sp =>
 });
 builder.Services.AddSingleton<IOrderPublisher, KafkaOrderPublisher>();
 
+// Read side: the portfolio is rebuilt from Kafka by a background consumer.
+builder.Services.AddSingleton<PortfolioState>();
+builder.Services.AddHostedService<PortfolioProjectionWorker>();
+
 var app = builder.Build();
 
 app.UseSwagger();
 app.UseSwaggerUI();
+
+app.MapGet("/portfolio", (PortfolioState portfolio) => portfolio.GetPortfolio());
+app.MapGet("/prices", (PortfolioState portfolio) => portfolio.GetPrices());
 
 app.MapPost("/orders", async (PlaceOrderRequest request, IOrderPublisher publisher,
     ILogger<Program> logger, CancellationToken ct) =>
