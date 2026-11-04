@@ -4,7 +4,8 @@ using Kotiz.Contracts;
 namespace Kotiz.OrderProcessor.Kafka;
 
 /// <summary>
-/// The consume loop: read a message, handle it, commit its offset. One message at a time.
+/// The consume loop: read a message (an order or a quote), handle it, commit its offset.
+/// One message at a time.
 /// </summary>
 public sealed class OrderConsumerWorker(
     OrderMessageHandler handler,
@@ -27,7 +28,9 @@ public sealed class OrderConsumerWorker(
             // We commit ourselves, only after a message is fully handled (at-least-once).
             EnableAutoCommit = false,
             // A brand-new group starts from the beginning of the topic, not just new messages.
-            AutoOffsetReset = AutoOffsetReset.Earliest
+            AutoOffsetReset = AutoOffsetReset.Earliest,
+            // Explicit on purpose: co-partitioning (see Subscribe below) relies on the range assignor.
+            PartitionAssignmentStrategy = PartitionAssignmentStrategy.Range
         };
 
         using var consumer = new ConsumerBuilder<string, string>(config)
@@ -38,8 +41,11 @@ public sealed class OrderConsumerWorker(
             .SetErrorHandler((_, error) => logger.LogWarning("Kafka consumer error: {Reason}", error.Reason))
             .Build();
 
-        consumer.Subscribe(Topics.OrdersPlaced);
-        logger.LogInformation("Subscribed to {Topic} as group {GroupId}", Topics.OrdersPlaced, config.GroupId);
+        // Both topics are keyed by symbol and have the same number of partitions. The default
+        // "range" assignor gives partition N of both topics to the same consumer, so the orders
+        // and the prices of a symbol always meet in the same instance (co-partitioning).
+        consumer.Subscribe([Topics.OrdersPlaced, Topics.MarketQuotes]);
+        logger.LogInformation("Subscribed to {Orders} and {Quotes} as group {GroupId}", Topics.OrdersPlaced, Topics.MarketQuotes, config.GroupId);
 
         try
         {
@@ -56,8 +62,9 @@ public sealed class OrderConsumerWorker(
                     continue;
                 }
 
-                logger.LogInformation("Received key {Key} from partition {Partition} @ offset {Offset}",
-                    result.Message.Key, result.Partition.Value, result.Offset.Value);
+                // Debug level: quotes arrive every second and would flood the log.
+                logger.LogDebug("Received {Topic} key {Key} from partition {Partition} @ offset {Offset}",
+                    result.Topic, result.Message.Key, result.Partition.Value, result.Offset.Value);
 
                 // Handles the message completely: processed, skipped as duplicate, or sent to the DLT.
                 // It only throws if even the DLT is unreachable; then we stop WITHOUT committing,

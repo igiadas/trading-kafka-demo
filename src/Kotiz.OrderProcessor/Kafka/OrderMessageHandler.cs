@@ -1,14 +1,15 @@
 using System.Text.Json;
 using Confluent.Kafka;
-using Microsoft.Extensions.Options;
 using Kotiz.Contracts;
 using Kotiz.OrderProcessor.Processing;
+using Microsoft.Extensions.Options;
 
 namespace Kotiz.OrderProcessor.Kafka;
 
 /// <summary>
-/// Decides what happens to one consumed message: process it, retry it, or dead-letter it.
-/// When this method returns normally the message is "done" and its offset can be committed.
+/// Decides what happens to one consumed message (an order or a quote): process it, retry it,
+/// or dead-letter it. When this method returns normally the message is "done" and its offset
+/// can be committed.
 /// </summary>
 public sealed class OrderMessageHandler(
     IOrderProcessor processor,
@@ -18,10 +19,15 @@ public sealed class OrderMessageHandler(
 {
     public async Task HandleAsync(ConsumeResult<string, string> message, CancellationToken cancellationToken)
     {
-        OrderPlaced order;
+        Func<CancellationToken, Task> process;
         try
         {
-            order = KafkaJson.Deserialize<OrderPlaced>(message.Message.Value);
+            process = message.Topic switch
+            {
+                Topics.OrdersPlaced => ProcessOrder(KafkaJson.Deserialize<OrderPlaced>(message.Message.Value)),
+                Topics.MarketQuotes => ProcessQuote(KafkaJson.Deserialize<Quote>(message.Message.Value)),
+                _ => throw new InvalidOperationException($"Unexpected topic '{message.Topic}'.")
+            };
         }
         catch (JsonException ex)
         {
@@ -35,10 +41,10 @@ public sealed class OrderMessageHandler(
         {
             try
             {
-                await processor.ProcessAsync(order, cancellationToken);
+                await process(cancellationToken);
                 return;
             }
-            catch (InvalidOrderException ex)
+            catch (InvalidMessageException ex)
             {
                 // Permanent business error: no point retrying.
                 await SendToDeadLetterAsync(message, ex, attempt, cancellationToken);
@@ -50,8 +56,8 @@ public sealed class OrderMessageHandler(
                 // These retries block this consumer, so keep the total wait well below
                 // max.poll.interval.ms (5 min by default) or the group will kick the consumer out.
                 var delay = options.DelayBeforeRetry(attempt);
-                logger.LogWarning(ex, "Attempt {Attempt}/{MaxAttempts} failed for order {OrderId}, retrying in {Delay} ms",
-                    attempt, options.MaxAttempts, order.OrderId, delay.TotalMilliseconds);
+                logger.LogWarning(ex, "Attempt {Attempt}/{MaxAttempts} failed for {Topic} key {Key}, retrying in {Delay} ms",
+                    attempt, options.MaxAttempts, message.Topic, message.Message.Key, delay.TotalMilliseconds);
                 await Task.Delay(delay, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -62,6 +68,10 @@ public sealed class OrderMessageHandler(
             }
         }
     }
+
+    private Func<CancellationToken, Task> ProcessOrder(OrderPlaced order) => ct => processor.ProcessOrderAsync(order, ct);
+
+    private Func<CancellationToken, Task> ProcessQuote(Quote quote) => ct => processor.ProcessQuoteAsync(quote, ct);
 
     private async Task SendToDeadLetterAsync(ConsumeResult<string, string> message, Exception error, int attempts, CancellationToken cancellationToken)
     {

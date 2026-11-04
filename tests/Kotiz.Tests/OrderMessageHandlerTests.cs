@@ -23,17 +23,17 @@ public class OrderMessageHandlerTests
         _handler = new OrderMessageHandler(_processor.Object, _deadLetters.Object, retry, NullLogger<OrderMessageHandler>.Instance);
     }
 
-    private static ConsumeResult<string, string> Consumed(string? value) => new()
+    private static ConsumeResult<string, string> Consumed(string? value, string topic = Topics.OrdersPlaced) => new()
     {
-        Topic = Topics.OrdersPlaced,
+        Topic = topic,
         Partition = new Partition(1),
         Offset = new Offset(42),
         // null simulates a tombstone (a message with no value).
-        Message = new Message<string, string> { Key = "SAN", Value = value! }
+        Message = new Message<string, string> { Key = "AAPL", Value = value! }
     };
 
     private static string ValidOrderJson() =>
-        KafkaJson.Serialize(new OrderPlaced(Guid.NewGuid(), "SAN", OrderSide.Buy, 100, 4.25m, DateTimeOffset.UtcNow));
+        KafkaJson.Serialize(new OrderPlaced(Guid.NewGuid(), "AAPL", OrderSide.Buy, OrderType.Market, 100, null, DateTimeOffset.UtcNow));
 
     private void VerifyNothingDeadLettered() =>
         _deadLetters.Verify(d => d.PublishAsync(It.IsAny<ConsumeResult<string, string>>(), It.IsAny<Exception>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
@@ -43,13 +43,13 @@ public class OrderMessageHandlerTests
     {
         await _handler.HandleAsync(Consumed(ValidOrderJson()), CancellationToken.None);
 
-        _processor.Verify(p => p.ProcessAsync(It.Is<OrderPlaced>(o => o.Symbol == "SAN" && o.Quantity == 100), It.IsAny<CancellationToken>()), Times.Once);
+        _processor.Verify(p => p.ProcessOrderAsync(It.Is<OrderPlaced>(o => o.Symbol == "AAPL" && o.Quantity == 100), It.IsAny<CancellationToken>()), Times.Once);
         VerifyNothingDeadLettered();
     }
 
     [Theory]
     [InlineData("{ this is not json")]
-    [InlineData("""{"orderId":"8b0e0c1e-5a43-4a0e-9a7e-2f6a4f1e9c11","symbol":"SAN","side":"Hold","quantity":1,"price":1}""")]
+    [InlineData("""{"orderId":"8b0e0c1e-5a43-4a0e-9a7e-2f6a4f1e9c11","symbol":"AAPL","side":"Hold","quantity":1,"price":1}""")]
     [InlineData(null)]
     public async Task Unreadable_message_goes_straight_to_the_DLT_without_processing(string? value)
     {
@@ -57,7 +57,7 @@ public class OrderMessageHandlerTests
 
         await _handler.HandleAsync(message, CancellationToken.None);
 
-        _processor.Verify(p => p.ProcessAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Never);
+        _processor.Verify(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Never);
         _deadLetters.Verify(d => d.PublishAsync(message, It.IsAny<JsonException>(), 1, It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -65,25 +65,25 @@ public class OrderMessageHandlerTests
     public async Task Invalid_order_goes_to_the_DLT_without_retrying()
     {
         var message = Consumed(ValidOrderJson());
-        var error = new InvalidOrderException("Symbol 'XYZ' is not tradable.");
-        _processor.Setup(p => p.ProcessAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>())).ThrowsAsync(error);
+        var error = new InvalidMessageException("Symbol 'XYZ' is not tradable.");
+        _processor.Setup(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>())).ThrowsAsync(error);
 
         await _handler.HandleAsync(message, CancellationToken.None);
 
-        _processor.Verify(p => p.ProcessAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Once);
+        _processor.Verify(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Once);
         _deadLetters.Verify(d => d.PublishAsync(message, error, 1, It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
     public async Task Transient_failure_is_retried_and_then_succeeds()
     {
-        _processor.SetupSequence(p => p.ProcessAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()))
+        _processor.SetupSequence(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new TimeoutException("broker unavailable"))
-            .ReturnsAsync(ProcessingOutcome.Executed);
+            .ReturnsAsync(OrderOutcome.Executed);
 
         await _handler.HandleAsync(Consumed(ValidOrderJson()), CancellationToken.None);
 
-        _processor.Verify(p => p.ProcessAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+        _processor.Verify(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
         VerifyNothingDeadLettered();
     }
 
@@ -92,11 +92,11 @@ public class OrderMessageHandlerTests
     {
         var message = Consumed(ValidOrderJson());
         var error = new TimeoutException("broker unavailable");
-        _processor.Setup(p => p.ProcessAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>())).ThrowsAsync(error);
+        _processor.Setup(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>())).ThrowsAsync(error);
 
         await _handler.HandleAsync(message, CancellationToken.None);
 
-        _processor.Verify(p => p.ProcessAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Exactly(3));
+        _processor.Verify(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Exactly(3));
         _deadLetters.Verify(d => d.PublishAsync(message, error, 3, It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -105,14 +105,37 @@ public class OrderMessageHandlerTests
     {
         using var cts = new CancellationTokenSource();
         cts.Cancel();
-        _processor.Setup(p => p.ProcessAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()))
+        _processor.Setup(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new OperationCanceledException(cts.Token));
 
         var act = () => _handler.HandleAsync(Consumed(ValidOrderJson()), cts.Token);
 
         await act.Should().ThrowAsync<OperationCanceledException>();
-        _processor.Verify(p => p.ProcessAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Once);
+        _processor.Verify(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Once);
         VerifyNothingDeadLettered();
+    }
+
+    [Fact]
+    public async Task Quote_message_is_routed_to_quote_processing()
+    {
+        var json = KafkaJson.Serialize(new Quote("AAPL", 230.15m, DateTimeOffset.UtcNow));
+
+        await _handler.HandleAsync(Consumed(json, Topics.MarketQuotes), CancellationToken.None);
+
+        _processor.Verify(p => p.ProcessQuoteAsync(It.Is<Quote>(q => q.Symbol == "AAPL" && q.Price == 230.15m), It.IsAny<CancellationToken>()), Times.Once);
+        _processor.Verify(p => p.ProcessOrderAsync(It.IsAny<OrderPlaced>(), It.IsAny<CancellationToken>()), Times.Never);
+        VerifyNothingDeadLettered();
+    }
+
+    [Fact]
+    public async Task Malformed_quote_goes_to_the_DLT()
+    {
+        var message = Consumed("not a quote", Topics.MarketQuotes);
+
+        await _handler.HandleAsync(message, CancellationToken.None);
+
+        _processor.Verify(p => p.ProcessQuoteAsync(It.IsAny<Quote>(), It.IsAny<CancellationToken>()), Times.Never);
+        _deadLetters.Verify(d => d.PublishAsync(message, It.IsAny<JsonException>(), 1, It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]

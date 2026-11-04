@@ -46,6 +46,7 @@ app.MapPost("/orders", async (PlaceOrderRequest request, IOrderPublisher publish
         request.OrderId ?? Guid.NewGuid(),
         request.Symbol.Trim().ToUpperInvariant(),
         request.Side,
+        request.Type,
         request.Quantity,
         request.Price,
         DateTimeOffset.UtcNow);

@@ -10,7 +10,7 @@ public interface IDeadLetterPublisher
 }
 
 /// <summary>
-/// Copies a message that could not be processed to the dead-letter topic, unchanged,
+/// Copies a message that could not be processed to its dead-letter topic ("{topic}.dlt"), unchanged,
 /// plus headers saying where it came from and why it failed. Someone can then inspect it
 /// (e.g. in kafka-ui), fix the cause and replay it, while the main topic keeps flowing.
 /// </summary>
@@ -29,7 +29,7 @@ public sealed class KafkaDeadLetterPublisher(IProducer<string, string> producer)
         Add(headers, "dlt-exception-message", error.Message);
         Add(headers, "dlt-attempts", attempts.ToString());
 
-        await producer.ProduceAsync(Topics.OrdersPlacedDeadLetter, new Message<string, string>
+        await producer.ProduceAsync(Topics.DeadLetterFor(failed.Topic), new Message<string, string>
         {
             Key = failed.Message.Key,
             Value = failed.Message.Value,

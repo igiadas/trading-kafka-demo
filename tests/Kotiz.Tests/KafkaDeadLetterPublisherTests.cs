@@ -31,7 +31,7 @@ public class KafkaDeadLetterPublisherTests
         await new KafkaDeadLetterPublisher(producer.Object)
             .PublishAsync(failed, new InvalidOperationException("boom"), attempts: 3, CancellationToken.None);
 
-        sentTopic.Should().Be(Topics.OrdersPlacedDeadLetter);
+        sentTopic.Should().Be("orders.placed.dlt");
         sent!.Key.Should().Be("XYZ");
         sent.Value.Should().Be("{\"symbol\":\"XYZ\"}");
 
