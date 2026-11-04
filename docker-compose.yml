@@ -75,7 +75,7 @@ services:
       dockerfile: src/Trading.OrderProcessor/Dockerfile
     environment:
       Kafka__BootstrapServers: kafka:29092
-    restart: on-failure
+    restart: unless-stopped
     depends_on:
       kafka-init:
         condition: service_completed_successfully
