@@ -2,63 +2,64 @@
 
 [![CI](https://github.com/igiadas/kotiz/actions/workflows/ci.yml/badge.svg)](https://github.com/igiadas/kotiz/actions/workflows/ci.yml)
 
-A small, personal learning project: an event-driven order flow for equity trading, built with
-**.NET 8** and **Apache Kafka** using the plain [`Confluent.Kafka`](https://github.com/confluentinc/confluent-kafka-dotnet)
-client (no MassTransit or other abstraction on top, so every Kafka concept is visible in the code).
+**Paper trading with real market prices.** Practise a strategy or watch a portfolio against live
+prices without risking money: place market, limit and stop orders, see positions and P&L update
+with every price, and get a Telegram message when a stop-loss is hit or a price moves sharply.
 
-- An **API** receives buy/sell orders and publishes them as `OrderPlaced` events.
-- A **worker** consumes them, keeps a net position per stock, and publishes `OrderExecuted` events.
-- Failures are handled explicitly: manual offset commits, idempotent processing, retries with backoff and a dead-letter topic.
+It is also a personal project to learn event-driven design properly: **.NET 8** services talking
+through **Apache Kafka**, using the plain [`Confluent.Kafka`](https://github.com/confluentinc/confluent-kafka-dotnet)
+client (no MassTransit or other abstraction), so every Kafka concept is visible in the code.
 
-The order "execution" is simulated. The point of the project is the messaging, not the trading logic.
+> Paper trading only: no real orders are sent anywhere, and fills are simplified (see the end of this page).
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    client([Client / Swagger]) -- "POST /orders" --> api[Order API<br/>ASP.NET Core]
-    api -- "OrderPlaced<br/>key = symbol" --> placed[(orders.placed<br/>3 partitions)]
-    placed --> worker[Order Processor<br/>Worker Service<br/>group: order-processor]
-    worker -- "OrderExecuted" --> executed[(orders.executed)]
-    worker -- "failed messages" --> dlt[(orders.placed.dlt)]
-    ui[kafka-ui] -. inspects .-> placed
-    ui -. inspects .-> executed
-    ui -. inspects .-> dlt
+    finnhub([Finnhub WebSocket<br/>or simulator]) --> md[market-data]
+    client([You / Swagger]) -- "POST /orders" --> api[order-api]
+    md -- "Quote<br/>key = symbol" --> quotes[(market.quotes<br/>compacted)]
+    api -- "OrderPlaced<br/>key = symbol" --> placed[(orders.placed)]
+    placed --> proc[order-processor<br/>matching engine]
+    quotes --> proc
+    proc -- "OrderExecuted" --> executed[(orders.executed)]
+    proc -- "failed messages" --> dlt[(*.dlt)]
+    executed --> api
+    quotes --> api
+    executed --> alerts[alerts]
+    quotes --> alerts
+    alerts --> tg([Telegram or log])
+    client -- "GET /portfolio" --> api
 ```
 
-What happens to one message in the worker:
+| Service | Consumer group | Reads | Writes |
+|---|---|---|---|
+| [`market-data`](src/Kotiz.MarketData) | (producer only) | Finnhub or simulator | `market.quotes` |
+| [`order-api`](src/Kotiz.OrderApi) | a new one on every start | `orders.executed`, `market.quotes` (from the beginning) | `orders.placed` |
+| [`order-processor`](src/Kotiz.OrderProcessor) | `order-processor` | `orders.placed`, `market.quotes` | `orders.executed`, `*.dlt` |
+| [`alerts`](src/Kotiz.Alerts) | `alerts` | `orders.executed`, `market.quotes` | Telegram |
 
-```mermaid
-flowchart TD
-    m[Consume message] --> json{Valid JSON?}
-    json -- no --> dlt[Send to DLT]
-    json -- yes --> dup{OrderId already<br/>processed?}
-    dup -- yes --> skip[Skip duplicate]
-    dup -- no --> valid{Valid order?<br/>tradable symbol, qty, price}
-    valid -- no --> dlt
-    valid -- yes --> exec[Publish OrderExecuted,<br/>update position]
-    exec -- "transient error" --> retry{Attempts left?}
-    retry -- "yes, wait 0.5s, 1s..." --> exec
-    retry -- no --> dlt
-    exec -- ok --> commit[Commit offset]
-    skip --> commit
-    dlt --> commit
-```
+[`Kotiz.Contracts`](src/Kotiz.Contracts) holds the events and topic names shared by all of them;
+[`tests/Kotiz.Tests`](tests/Kotiz.Tests) uses xUnit, FluentAssertions and Moq.
 
-| Project | What it is |
-|---|---|
-| [`src/Kotiz.Contracts`](src/Kotiz.Contracts) | Events, topic names and JSON settings shared by both services |
-| [`src/Kotiz.OrderApi`](src/Kotiz.OrderApi) | Minimal API, the Kafka **producer** |
-| [`src/Kotiz.OrderProcessor`](src/Kotiz.OrderProcessor) | Worker Service, the Kafka **consumer**. `Processing/` is business logic, `Kafka/` is everything Kafka-specific |
-| [`tests/Kotiz.Tests`](tests/Kotiz.Tests) | xUnit + FluentAssertions + Moq |
+### Why Kafka fits here
+
+Prices are a continuous stream of events, and several parts of the system need the **same** stream
+for **different** reasons: the matching engine to fill orders, the portfolio to value positions, the
+alerts service to spot sharp moves. With Kafka each one is an independent consumer group with its own
+position in the log, its own pace and its own delivery guarantees, and adding a fourth consumer needs no
+change to the others. Because the log is kept, the API can rebuild the whole portfolio by reading it
+again from the beginning, and a service that was down simply catches up.
 
 ## Running it
 
-Requirements: Docker. (.NET 8 SDK only if you want to run the tests or the services outside Docker.)
+Requirements: Docker. (.NET 8 SDK only to run the tests or the services outside Docker.)
 
 ```bash
 docker compose up --build
 ```
+
+That is all: with no configuration, prices are **simulated** and alerts are **written to the log**.
 
 | URL | |
 |---|---|
@@ -68,122 +69,151 @@ docker compose up --build
 ### Try it
 
 ```bash
-# A normal order -> processed, appears in orders.executed
-curl -X POST http://localhost:5080/orders -H "Content-Type: application/json" \
-  -d '{"symbol":"SAN","side":"Buy","quantity":100,"price":4.25}'
+# Current prices
+curl http://localhost:5080/prices
 
-# The same OrderId twice -> the second one is skipped as a duplicate (see the worker logs)
+# Market order: fills at the latest price
 curl -X POST http://localhost:5080/orders -H "Content-Type: application/json" \
-  -d '{"symbol":"ITX","side":"Buy","quantity":10,"price":48.10,"orderId":"11111111-1111-1111-1111-111111111111"}'
+  -d '{"symbol":"AAPL","side":"Buy","quantity":10}'
 
-# Unknown symbol -> the API accepts it, the worker rejects it -> orders.placed.dlt
+# Stop-loss: sells if the price falls to 220 (adjust it to the current price)
 curl -X POST http://localhost:5080/orders -H "Content-Type: application/json" \
-  -d '{"symbol":"XYZ","side":"Buy","quantity":5,"price":1.00}'
+  -d '{"symbol":"AAPL","side":"Sell","quantity":10,"type":"Stop","price":220}'
+
+# Take profit: sells if the price rises to 250
+curl -X POST http://localhost:5080/orders -H "Content-Type: application/json" \
+  -d '{"symbol":"AAPL","side":"Sell","quantity":10,"type":"Limit","price":250}'
+
+# Positions, average price, realized and unrealized P&L
+curl http://localhost:5080/portfolio
 ```
-
-To send a malformed message, open kafka-ui, go to **Topics → orders.placed → Produce Message** and send
-any value that is not valid JSON: it goes straight to `orders.placed.dlt`. Open a DLT message in kafka-ui
-and look at its **Headers**: original topic, partition, offset, exception and number of attempts.
-
-Watch the worker:
 
 ```bash
-docker compose logs -f order-processor
+docker compose logs -f order-processor alerts
 ```
 
-See the consumer group share the partitions between instances (watch the "Partitions assigned" lines):
+Failure paths:
+- An unknown symbol (`"symbol":"XYZ"`) is accepted by the API but rejected by the processor: it lands in
+  `orders.placed.dlt`. Open it in kafka-ui and look at the message **Headers** (original topic, partition,
+  offset, error, attempts).
+- Sending the same `orderId` twice: the second one is skipped as a duplicate (see the processor log).
+- Any non-JSON value produced to `orders.placed` from kafka-ui (**Produce Message**) goes straight to the DLT.
+
+Scale the processor and watch the group split the partitions ("Partitions assigned" in the log):
 
 ```bash
 docker compose up -d --scale order-processor=3
 ```
 
-Stop and remove everything (Kafka data is not persisted, so the next `up` starts with empty topics):
+Stop with `docker compose stop` (keeps the data) or `docker compose down` (deletes everything).
 
-```bash
-docker compose down
-```
+### Real prices (Finnhub)
 
-### Tests
+1. Create a free account at [finnhub.io/register](https://finnhub.io/register) and copy the API key from the dashboard.
+2. `cp .env.example .env` and set:
+   ```
+   MARKET_DATA_SOURCE=Finnhub
+   FINNHUB_API_KEY=your-key
+   SYMBOLS=AAPL,MSFT,NVDA,BINANCE:BTCUSDT
+   ```
+3. `docker compose up -d --build`
+
+Why Finnhub: the free plan streams real-time trades over a WebSocket for **US stocks and crypto**, and only
+needs one API key. Neither Finnhub nor Alpaca (the other free option considered) covers the Spanish market
+for free, so the examples use US symbols. Crypto (`BINANCE:BTCUSDT`) trades 24/7, which is handy outside US
+market hours (15:30–22:00 CET). Alpaca's free IEX feed gives real bid/ask quotes, but needs a key and a
+secret and only covers US stocks. Finnhub sends the **last traded price**, not bid/ask, and Kotiz fills
+orders at that price.
+
+### Telegram alerts (optional)
+
+1. In Telegram, talk to [@BotFather](https://t.me/BotFather), send `/newbot` and copy the token.
+2. Send any message to your new bot, then open `https://api.telegram.org/bot<TOKEN>/getUpdates`
+   and copy `message.chat.id`.
+3. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` and restart: `docker compose up -d alerts`.
+
+Keys only live in `.env` (ignored by git) or environment variables. Never commit them.
+
+### Tests and running outside Docker
 
 ```bash
 dotnet test
 ```
 
-The tests cover the processing logic (positions, duplicates, validation, safe retries), the retry/DLT
-decisions and the DLT message format. The Kafka loop itself is checked by running the stack above.
+Tests cover the matching rules, the P&L math, idempotency, the retry/DLT decisions, the sharp-move
+detector and the Finnhub message parser. The Kafka loops themselves are checked by running the stack.
 
-### Running the services outside Docker
-
-Start only Kafka (and the UI) with `docker compose up kafka kafka-init kafka-ui`, then
-`dotnet run --project src/Kotiz.OrderApi` and `dotnet run --project src/Kotiz.OrderProcessor`.
-Both use `localhost:9092` by default.
+To run a service from your IDE, start the infrastructure with `docker compose up kafka kafka-init kafka-ui`
+and `dotnet run --project src/Kotiz.<Service>`: everything uses `localhost:9092` by default. For the
+Finnhub key, use `dotnet user-secrets set "Market:FinnhubApiKey" "<key>" --project src/Kotiz.MarketData`.
 
 ## Kafka concepts, and where they are in the code
 
-**Topic.** A named, append-only log of messages. There are three, created by the `kafka-init` service in
-[`docker-compose.yml`](docker-compose.yml) (auto-creation is disabled), and named in
+**Topic.** A named, append-only log of messages, created by the `kafka-init` service in
+[`docker-compose.yml`](docker-compose.yml) (auto-creation is disabled) and named in
 [`Topics.cs`](src/Kotiz.Contracts/Topics.cs).
 
-**Partition.** Each topic is split into 3 partitions. Partitions are the unit of parallelism: within a
-consumer group, one partition is read by one consumer only. Ordering is guaranteed **within a partition**,
-not across the topic.
+**Partition.** Each topic has 3 partitions: the unit of parallelism (one partition is read by one consumer
+of a group) and of ordering (guaranteed **within a partition**, not across the topic).
 
-**Key.** Kafka picks the partition by hashing the message key. The API uses the stock symbol as the key
-([`KafkaOrderPublisher.cs`](src/Kotiz.OrderApi/KafkaOrderPublisher.cs)), so all orders for `SAN` go to
-the same partition and are processed in the order they were sent. That is why
-[`PositionBook`](src/Kotiz.OrderProcessor/Processing/PositionBook.cs) needs no locking.
+**Key.** The partition is picked by hashing the key. Orders and prices both use the symbol
+([`KafkaOrderPublisher.cs`](src/Kotiz.OrderApi/KafkaOrderPublisher.cs),
+[`QuotePublisherWorker.cs`](src/Kotiz.MarketData/QuotePublisherWorker.cs)), so all of AAPL's orders are in
+order, in one partition.
 
-**Consumer group.** All worker instances share the `GroupId` `order-processor`
-([`appsettings.json`](src/Kotiz.OrderProcessor/appsettings.json)). Kafka divides the partitions among
-them and moves them when an instance joins or leaves (a *rebalance*, logged by the handlers in
-[`OrderConsumerWorker.cs`](src/Kotiz.OrderProcessor/Kafka/OrderConsumerWorker.cs)). More instances
-than partitions means idle instances.
+**Co-partitioning.** `orders.placed` and `market.quotes` have the same number of partitions, the same key and
+the same partitioner (both producers use librdkafka's default), so AAPL is in the same partition number in both. The processor subscribes to both with the *range* assignor,
+which gives partition N of every topic to the same consumer: an order and the prices that fill it always
+meet in the same instance, with no shared state ([`OrderConsumerWorker.cs`](src/Kotiz.OrderProcessor/Kafka/OrderConsumerWorker.cs),
+[`MatchingEngine.cs`](src/Kotiz.OrderProcessor/Processing/MatchingEngine.cs)).
 
-**Offset.** The position of a message in a partition. The group *commits* the offset it has finished
-with, so a restarted consumer continues from there. `EnableAutoCommit = false`, and
-`consumer.Commit(result)` is called only **after** the message is fully handled
-([`OrderConsumerWorker.cs`](src/Kotiz.OrderProcessor/Kafka/OrderConsumerWorker.cs)).
-`AutoOffsetReset = Earliest` decides where a group with no committed offset starts.
+**Consumer groups.** Three groups read the same topics independently (table above). Within the
+`order-processor` group, instances share the partitions and Kafka moves them when one joins or leaves
+(a *rebalance*, logged by the handlers in `OrderConsumerWorker.cs`).
 
-**Delivery guarantees.**
-- *At-most-once*: commit before processing. A crash loses the message.
-- *At-least-once* (this project): commit after processing. A crash between processing and commit
-  means the message is delivered again, so duplicates are possible and must be handled.
-- *Exactly-once*: Kafka transactions (`read-process-write` with `SendOffsetsToTransaction`). Only covers
-  Kafka-to-Kafka; any external side effect (a database, an email) still needs idempotency.
+**Offsets and delivery guarantees.** Each service chooses what it needs:
+- `order-processor`: **at-least-once**. `EnableAutoCommit = false` and `consumer.Commit(result)` only after
+  the message is fully handled. A crash in between means the message is delivered again.
+- `alerts`: auto-commit and `AutoOffsetReset = Latest` ([`AlertsWorker.cs`](src/Kotiz.Alerts/AlertsWorker.cs)).
+  An alert may rarely be lost or repeated, and alerts about the past are useless.
+- `order-api`: commits nothing; a fresh group on every start re-reads everything
+  ([`PortfolioProjectionWorker.cs`](src/Kotiz.OrderApi/Portfolio/PortfolioProjectionWorker.cs)).
+- Exactly-once would need Kafka transactions, and only covers Kafka-to-Kafka; external effects still need idempotency.
 
-On the producer side, `Acks = All` waits for all in-sync replicas, and `EnableIdempotence = true` stops the
-producer's own retries from writing duplicates ([`Program.cs`](src/Kotiz.OrderApi/Program.cs)).
+**Producer settings.** `Acks = All` plus `EnableIdempotence = true` for orders, awaiting each
+`ProduceAsync` ([`Program.cs`](src/Kotiz.OrderApi/Program.cs)). Prices use fire-and-forget `Produce` with a
+delivery callback: a lost price is replaced a second later, a lost order is not.
 
-**Idempotent consumer.** Because delivery is at-least-once, the worker remembers processed `OrderId`s and
-skips repeats ([`OrderProcessor.cs`](src/Kotiz.OrderProcessor/Processing/OrderProcessor.cs),
-[`ProcessedOrderStore.cs`](src/Kotiz.OrderProcessor/Processing/ProcessedOrderStore.cs)). The order of
-steps matters: the only call that can fail (publishing `OrderExecuted`) runs **before** any local state
-changes, so a failed attempt can be retried safely.
+**Idempotent consumers.** The processor skips an `OrderId` it has already seen
+([`OrderProcessor.cs`](src/Kotiz.OrderProcessor/Processing/OrderProcessor.cs)), and so does the portfolio
+([`PortfolioState.cs`](src/Kotiz.OrderApi/Portfolio/PortfolioState.cs)). The processor always publishes first
+and changes state after: a pending order leaves the book only once its execution is in Kafka, so a retried
+price never fills an order twice.
 
-**Retries with backoff.** Unexpected errors are treated as transient: up to 3 attempts in total, waiting
-0.5 s, then 1 s ([`OrderMessageHandler.cs`](src/Kotiz.OrderProcessor/Kafka/OrderMessageHandler.cs),
-[`RetryOptions.cs`](src/Kotiz.OrderProcessor/Kafka/RetryOptions.cs)). Errors that a retry can never fix
-(malformed JSON, `InvalidOrderException`) skip the retries.
+**Retries, backoff and dead-letter topics.** Unexpected errors are retried (3 attempts in total, waiting 0.5 s
+then 1 s); errors no retry can fix (bad JSON, invalid order) are not
+([`OrderMessageHandler.cs`](src/Kotiz.OrderProcessor/Kafka/OrderMessageHandler.cs)). A message that cannot be
+processed is copied to `<topic>.dlt` with headers explaining why
+([`KafkaDeadLetterPublisher.cs`](src/Kotiz.OrderProcessor/Kafka/KafkaDeadLetterPublisher.cs)) and its offset is
+committed, so one bad message never blocks a partition. If even the DLT cannot be written, the processor stops
+**without** committing and the message is read again after the restart.
 
-**Dead-letter topic (DLT).** A message that cannot be processed is copied unchanged to `orders.placed.dlt`
-with headers explaining the failure ([`KafkaDeadLetterPublisher.cs`](src/Kotiz.OrderProcessor/Kafka/KafkaDeadLetterPublisher.cs)),
-and its offset is committed. One bad message (a *poison message*) does not block the partition, and
-nothing is lost silently. If even the DLT cannot be written, the worker stops **without** committing, so
-the message is consumed again after the restart.
+**Log compaction.** `market.quotes` is compacted: Kafka keeps at least the latest message per key, so it never
+grows without limit and any new consumer can learn the last price of every symbol by reading it from the start.
+
+**Projection (read model).** The portfolio is never written directly: it is derived from `orders.executed`
+and `market.quotes`. The event log is the source of truth.
 
 ## Simplifications (deliberate, and what production would do)
 
-- **In-memory state.** Positions and processed `OrderId`s live in memory: lost on restart, and not shared
-  between instances (after a rebalance, the new owner of a partition starts with an empty position).
-  Production: a database, with the position update and the processed-id insert in one transaction,
-  or Kafka Streams state stores.
-- **One message at a time** with a synchronous commit per message: simple and easy to reason about,
-  not the fastest. Faster options: commit in batches, or `StoreOffset` with auto-commit.
-- **In-place retries block the partition** while waiting. Fine for short waits (they must stay well under
-  `max.poll.interval.ms`); for long ones, use separate retry topics.
-- **JSON values without a schema.** Production usually uses a Schema Registry with Avro or Protobuf.
-- **Default (eager) rebalancing**: every instance gives up all its partitions on each rebalance. The
-  cooperative-sticky assignor avoids that.
-- **Single broker, replication factor 1, plaintext**: a demo setup. Production uses at least 3 brokers,
+- **Fills.** Orders fill completely at the last traded price, with no bid/ask spread, partial fills or
+  liquidity. A stop fills at the first price at or past the stop (so below it on a gap down, as in a real market).
+- **Pending orders live in memory** in the processor: a restart loses open limit/stop orders. Production: a
+  compacted `orders.open` topic or a database, rebuilt on startup. The same applies to the processed-ids set.
+- **Positions and P&L** are recomputed by the API on each start, which is fine for one user's history; a
+  large history would use snapshots.
+- **One message at a time** with a synchronous commit per message: simple, not the fastest.
+- **In-place retries block the partition** while waiting; long waits would need retry topics.
+- **JSON without a schema.** Production usually uses a Schema Registry with Avro or Protobuf.
+- **Single broker, replication factor 1, plaintext.** Production: at least 3 brokers,
   `min.insync.replicas = 2`, TLS and authentication.
