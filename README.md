@@ -1,6 +1,6 @@
-# Trading Kafka Demo
+# Kotiz
 
-[![CI](https://github.com/igiadas/trading-kafka-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/igiadas/trading-kafka-demo/actions/workflows/ci.yml)
+[![CI](https://github.com/igiadas/kotiz/actions/workflows/ci.yml/badge.svg)](https://github.com/igiadas/kotiz/actions/workflows/ci.yml)
 
 A small, personal learning project: an event-driven order flow for equity trading, built with
 **.NET 8** and **Apache Kafka** using the plain [`Confluent.Kafka`](https://github.com/confluentinc/confluent-kafka-dotnet)
@@ -47,10 +47,10 @@ flowchart TD
 
 | Project | What it is |
 |---|---|
-| [`src/Trading.Contracts`](src/Trading.Contracts) | Events, topic names and JSON settings shared by both services |
-| [`src/Trading.OrderApi`](src/Trading.OrderApi) | Minimal API, the Kafka **producer** |
-| [`src/Trading.OrderProcessor`](src/Trading.OrderProcessor) | Worker Service, the Kafka **consumer**. `Processing/` is business logic, `Kafka/` is everything Kafka-specific |
-| [`tests/Trading.Tests`](tests/Trading.Tests) | xUnit + FluentAssertions + Moq |
+| [`src/Kotiz.Contracts`](src/Kotiz.Contracts) | Events, topic names and JSON settings shared by both services |
+| [`src/Kotiz.OrderApi`](src/Kotiz.OrderApi) | Minimal API, the Kafka **producer** |
+| [`src/Kotiz.OrderProcessor`](src/Kotiz.OrderProcessor) | Worker Service, the Kafka **consumer**. `Processing/` is business logic, `Kafka/` is everything Kafka-specific |
+| [`tests/Kotiz.Tests`](tests/Kotiz.Tests) | xUnit + FluentAssertions + Moq |
 
 ## Running it
 
@@ -115,34 +115,34 @@ decisions and the DLT message format. The Kafka loop itself is checked by runnin
 ### Running the services outside Docker
 
 Start only Kafka (and the UI) with `docker compose up kafka kafka-init kafka-ui`, then
-`dotnet run --project src/Trading.OrderApi` and `dotnet run --project src/Trading.OrderProcessor`.
+`dotnet run --project src/Kotiz.OrderApi` and `dotnet run --project src/Kotiz.OrderProcessor`.
 Both use `localhost:9092` by default.
 
 ## Kafka concepts, and where they are in the code
 
 **Topic.** A named, append-only log of messages. There are three, created by the `kafka-init` service in
 [`docker-compose.yml`](docker-compose.yml) (auto-creation is disabled), and named in
-[`Topics.cs`](src/Trading.Contracts/Topics.cs).
+[`Topics.cs`](src/Kotiz.Contracts/Topics.cs).
 
 **Partition.** Each topic is split into 3 partitions. Partitions are the unit of parallelism: within a
 consumer group, one partition is read by one consumer only. Ordering is guaranteed **within a partition**,
 not across the topic.
 
 **Key.** Kafka picks the partition by hashing the message key. The API uses the stock symbol as the key
-([`KafkaOrderPublisher.cs`](src/Trading.OrderApi/KafkaOrderPublisher.cs)), so all orders for `SAN` go to
+([`KafkaOrderPublisher.cs`](src/Kotiz.OrderApi/KafkaOrderPublisher.cs)), so all orders for `SAN` go to
 the same partition and are processed in the order they were sent. That is why
-[`PositionBook`](src/Trading.OrderProcessor/Processing/PositionBook.cs) needs no locking.
+[`PositionBook`](src/Kotiz.OrderProcessor/Processing/PositionBook.cs) needs no locking.
 
 **Consumer group.** All worker instances share the `GroupId` `order-processor`
-([`appsettings.json`](src/Trading.OrderProcessor/appsettings.json)). Kafka divides the partitions among
+([`appsettings.json`](src/Kotiz.OrderProcessor/appsettings.json)). Kafka divides the partitions among
 them and moves them when an instance joins or leaves (a *rebalance*, logged by the handlers in
-[`OrderConsumerWorker.cs`](src/Trading.OrderProcessor/Kafka/OrderConsumerWorker.cs)). More instances
+[`OrderConsumerWorker.cs`](src/Kotiz.OrderProcessor/Kafka/OrderConsumerWorker.cs)). More instances
 than partitions means idle instances.
 
 **Offset.** The position of a message in a partition. The group *commits* the offset it has finished
 with, so a restarted consumer continues from there. `EnableAutoCommit = false`, and
 `consumer.Commit(result)` is called only **after** the message is fully handled
-([`OrderConsumerWorker.cs`](src/Trading.OrderProcessor/Kafka/OrderConsumerWorker.cs)).
+([`OrderConsumerWorker.cs`](src/Kotiz.OrderProcessor/Kafka/OrderConsumerWorker.cs)).
 `AutoOffsetReset = Earliest` decides where a group with no committed offset starts.
 
 **Delivery guarantees.**
@@ -153,21 +153,21 @@ with, so a restarted consumer continues from there. `EnableAutoCommit = false`, 
   Kafka-to-Kafka; any external side effect (a database, an email) still needs idempotency.
 
 On the producer side, `Acks = All` waits for all in-sync replicas, and `EnableIdempotence = true` stops the
-producer's own retries from writing duplicates ([`Program.cs`](src/Trading.OrderApi/Program.cs)).
+producer's own retries from writing duplicates ([`Program.cs`](src/Kotiz.OrderApi/Program.cs)).
 
 **Idempotent consumer.** Because delivery is at-least-once, the worker remembers processed `OrderId`s and
-skips repeats ([`OrderProcessor.cs`](src/Trading.OrderProcessor/Processing/OrderProcessor.cs),
-[`ProcessedOrderStore.cs`](src/Trading.OrderProcessor/Processing/ProcessedOrderStore.cs)). The order of
+skips repeats ([`OrderProcessor.cs`](src/Kotiz.OrderProcessor/Processing/OrderProcessor.cs),
+[`ProcessedOrderStore.cs`](src/Kotiz.OrderProcessor/Processing/ProcessedOrderStore.cs)). The order of
 steps matters: the only call that can fail (publishing `OrderExecuted`) runs **before** any local state
 changes, so a failed attempt can be retried safely.
 
 **Retries with backoff.** Unexpected errors are treated as transient: up to 3 attempts in total, waiting
-0.5 s, then 1 s ([`OrderMessageHandler.cs`](src/Trading.OrderProcessor/Kafka/OrderMessageHandler.cs),
-[`RetryOptions.cs`](src/Trading.OrderProcessor/Kafka/RetryOptions.cs)). Errors that a retry can never fix
+0.5 s, then 1 s ([`OrderMessageHandler.cs`](src/Kotiz.OrderProcessor/Kafka/OrderMessageHandler.cs),
+[`RetryOptions.cs`](src/Kotiz.OrderProcessor/Kafka/RetryOptions.cs)). Errors that a retry can never fix
 (malformed JSON, `InvalidOrderException`) skip the retries.
 
 **Dead-letter topic (DLT).** A message that cannot be processed is copied unchanged to `orders.placed.dlt`
-with headers explaining the failure ([`KafkaDeadLetterPublisher.cs`](src/Trading.OrderProcessor/Kafka/KafkaDeadLetterPublisher.cs)),
+with headers explaining the failure ([`KafkaDeadLetterPublisher.cs`](src/Kotiz.OrderProcessor/Kafka/KafkaDeadLetterPublisher.cs)),
 and its offset is committed. One bad message (a *poison message*) does not block the partition, and
 nothing is lost silently. If even the DLT cannot be written, the worker stops **without** committing, so
 the message is consumed again after the restart.
