@@ -25,6 +25,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Kotiz.OrderProcessor\Kotiz.OrderProcessor.csproj" />
     <ProjectReference Include="..\..\src\Kotiz.OrderApi\Kotiz.OrderApi.csproj" />
+    <ProjectReference Include="..\..\src\Kotiz.MarketData\Kotiz.MarketData.csproj" />
   </ItemGroup>
 
 </Project>
