@@ -1,3 +1,7 @@
+# Settings come from a .env file next to this one (see .env.example). Everything has a default,
+# so "docker compose up" works without any .env: simulated prices, alerts in the log.
+name: kotiz
+
 services:
   # Single Kafka node in KRaft mode: it is both broker and controller, no ZooKeeper.
   kafka:
@@ -29,6 +33,8 @@ services:
       start_period: 10s
 
   # Creates the topics once Kafka is up, then exits.
+  # orders.placed and market.quotes MUST have the same number of partitions: the order processor
+  # relies on it to receive the orders and the prices of a symbol in the same consumer.
   kafka-init:
     image: apache/kafka:4.3.2
     depends_on:
@@ -38,10 +44,16 @@ services:
     command:
       - |
         set -e
-        for topic in orders.placed orders.executed orders.placed.dlt; do
+        create() {
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
-            --topic "$$topic" --partitions 3 --replication-factor 1
-        done
+            --replication-factor 1 --partitions 3 --topic "$$@"
+        }
+        create orders.placed
+        create orders.executed
+        # Compacted: Kafka keeps (at least) the latest price of every symbol, forever.
+        create market.quotes --config cleanup.policy=compact --config segment.ms=600000
+        create orders.placed.dlt
+        create market.quotes.dlt
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --describe
 
   kafka-ui:
@@ -54,6 +66,20 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+
+  market-data:
+    build:
+      context: .
+      dockerfile: src/Kotiz.MarketData/Dockerfile
+    environment:
+      Kafka__BootstrapServers: kafka:29092
+      Market__Source: ${MARKET_DATA_SOURCE:-Simulated}
+      Market__Symbols: ${SYMBOLS:-AAPL,MSFT,NVDA,TSLA,AMZN}
+      Market__FinnhubApiKey: ${FINNHUB_API_KEY:-}
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
 
   order-api:
     build:
@@ -75,6 +101,20 @@ services:
       dockerfile: src/Kotiz.OrderProcessor/Dockerfile
     environment:
       Kafka__BootstrapServers: kafka:29092
+      Market__Symbols: ${SYMBOLS:-AAPL,MSFT,NVDA,TSLA,AMZN}
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  alerts:
+    build:
+      context: .
+      dockerfile: src/Kotiz.Alerts/Dockerfile
+    environment:
+      Kafka__BootstrapServers: kafka:29092
+      Alerts__TelegramBotToken: ${TELEGRAM_BOT_TOKEN:-}
+      Alerts__TelegramChatId: ${TELEGRAM_CHAT_ID:-}
     restart: unless-stopped
     depends_on:
       kafka-init:
